@@ -1,4 +1,4 @@
-# LSS Personalübersicht - Vollversion
+# LSS Personalübersicht - Vollversion(AKKTUELL ÜBERARBEITUNG)
 
 Ein Userscript für [Leitstellenspiel.de](https://www.leitstellenspiel.de/), das eine **dragbare und resizable Personalübersicht** bietet. Alle Gebäude, exakte Fahrzeugzählungen, Filter, Sortierung, Auto-Refresh und CSV-Export inklusive.
 
