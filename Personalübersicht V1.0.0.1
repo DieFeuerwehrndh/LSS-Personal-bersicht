@@ -1,0 +1,734 @@
+// ==UserScript==
+// @name         LSS Personalübersicht
+// @namespace    DieFeuerwehrndh
+// @version      1.0.0.1
+// @description  Großes, dragbares Fenster: alle Gebäude + exakte Fahrzeugzählungen, Filter, Sort, Auto-Refresh, CSV-Export.
+// @match        https://www.leitstellenspiel.de/*
+
+// @grant        none
+// @run-at       document-end
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    /************************************************************************
+     * Konfiguration
+     ************************************************************************/
+    const CFG = {
+        vehiclesLimitPerPage: 1000, // Limit pro Page für v2 API
+        apiRetries: 2,
+        reqTimeout: 15000,
+        autoRefreshMs: 60000, // default 60s
+        defaultWidthPercent: 50, // Fenster Breite in % (halbseitig)
+        defaultHeightPercent: 70, // Fenster Höhe in %
+        minWidthPx: 400,
+        minHeightPx: 240,
+        storageKey: 'lss_personal_overview_v1'
+    };
+
+    const UI_COLORS = {
+        headerBg: '#b71c1c', headerFg: '#fff', border: '#a94442',
+        rowEven: '#0e0e0e', rowOdd: '#111', rowHover: '#1b1b1b',
+        subtle: '#9aa0a6', ok: '#9fd29f', warn: '#ffd27a', bad: '#ff8a8a',
+        windowBg: '#0b0b0b', panelBg: '#0d0d0d'
+    };
+
+    const ORIGIN = `${location.protocol}//${location.host}`; // wir benutzen genau die Host-Variante, auf der du gerade bist
+
+    /************************************************************************
+     * Hilfsfunktionen: Storage, sleep, timeout, fetch mit Retry
+     ************************************************************************/
+    function saveSettings(obj) {
+        try {
+            localStorage.setItem(CFG.storageKey, JSON.stringify(obj));
+        } catch (e) { console.warn('LSS-PER: saveSettings failed', e); }
+    }
+    function loadSettings() {
+        try {
+            const s = localStorage.getItem(CFG.storageKey);
+            if (!s) return null;
+            return JSON.parse(s);
+        } catch (e) { return null; }
+    }
+
+    function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+    function withTimeout(promise, ms, label = 'request') {
+        let t;
+        const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(label + ' timeout')), ms); });
+        return Promise.race([promise.finally(() => clearTimeout(t)), timeout]);
+    }
+
+    async function fetchJsonWithRetries(pathOrUrl, label = 'fetch', retries = CFG.apiRetries) {
+        // ensure absolute URL on same origin if relative path
+        let final = (typeof pathOrUrl === 'string' && /^https?:\/\//i.test(pathOrUrl)) ? pathOrUrl : ORIGIN + (pathOrUrl.startsWith('/') ? pathOrUrl : '/' + pathOrUrl);
+        for (let i = 0; i <= retries; i++) {
+            try {
+                const res = await withTimeout(fetch(final, { credentials: 'include', redirect: 'follow' }), CFG.reqTimeout, label);
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+                const txt = await res.text();
+                // manche Antworten können kein JSON sein -> fallback
+                try { return JSON.parse(txt); } catch (e) { return txt; }
+            } catch (err) {
+                console.warn(`LSS-PER: fetch failed attempt ${i} -> ${final}`, err);
+                if (i === retries) throw err;
+                await sleep(300 * (i + 1));
+            }
+        }
+    }
+
+    /************************************************************************
+     * API-Ladefunktionen (Buildings + Vehicles robust inkl. Paging)
+     ************************************************************************/
+    async function loadBuildings() {
+        // /api/buildings liefert meist ein Array
+        const path = '/api/buildings';
+        const res = await fetchJsonWithRetries(path, 'buildings');
+        // falls die API eine Struktur { result: [...] } liefert, normalisieren
+        if (!res) return [];
+        if (Array.isArray(res)) return res;
+        if (res.result && Array.isArray(res.result)) return res.result;
+        if (res.buildings && Array.isArray(res.buildings)) return res.buildings;
+        // fallback: wenn string -> leeres
+        return [];
+    }
+
+    async function loadVehiclesAll() {
+        // benutze v2 mit ?limit=... und paging.next_page falls vorhanden
+        const base = `/api/v2/vehicles?limit=${CFG.vehiclesLimitPerPage}`;
+        let next = base;
+        const out = [];
+        while (next) {
+            const res = await fetchJsonWithRetries(next, 'vehicles');
+            // standard: res.result ist array (bei v2)
+            let list = [];
+            if (!res) { break; }
+            if (Array.isArray(res)) list = res;
+            else if (Array.isArray(res.result)) list = res.result;
+            else if (Array.isArray(res.vehicles)) list = res.vehicles;
+            else {
+                // fallback: wenn string oder anderes, break
+                break;
+            }
+            out.push(...list);
+            // paging
+            const nextPage = (res.paging && res.paging.next_page) ? res.paging.next_page : null;
+            if (!nextPage) { next = null; break; }
+            // make absolute on same origin if needed
+            if (/^https?:\/\//i.test(nextPage)) {
+                // replace host with current host but keep path+query+hash
+                try {
+                    const u = new URL(nextPage);
+                    next = ORIGIN + u.pathname + u.search + u.hash;
+                } catch (e) { next = ORIGIN + (nextPage.startsWith('/') ? nextPage : '/' + nextPage); }
+            } else {
+                next = nextPage.startsWith('/') ? ORIGIN + nextPage : ORIGIN + '/' + nextPage;
+            }
+        }
+        // fallback to older endpoint if nothing found
+        if (out.length === 0) {
+            try {
+                const v1 = await fetchJsonWithRetries('/api/vehicles', 'vehicles-v1');
+                if (Array.isArray(v1)) return v1;
+                if (v1.result && Array.isArray(v1.result)) return v1.result;
+                if (v1.vehicles && Array.isArray(v1.vehicles)) return v1.vehicles;
+            } catch (e) {
+                console.warn('LSS-PER: vehicles v1 fallback failed', e);
+            }
+        }
+        return out;
+    }
+
+    /************************************************************************
+     * Datenaufbereitung: Gebäude + Fahrzeuge zusammenführen und Metriken
+     ************************************************************************/
+    function buildIndex(buildings, vehicles) {
+        const byId = {};
+        // normalize building fields robust
+        (buildings || []).forEach(b => {
+            const id = b.id ?? b.building_id ?? null;
+            if (!id) return;
+            byId[id] = {
+                id,
+                name: b.caption || b.name || b.display_name || ('Wache ' + id),
+                staff: Number(b.personal_count ?? b.personal ?? b.staff ?? 0),
+                raw: b,
+                vehicles: [],
+                staff_needed: 0
+            };
+        });
+
+        (vehicles || []).forEach(v => {
+            // building id location might be building_id
+            const bid = v.building_id ?? v.building ?? v.station_id ?? null;
+            if (!bid) return;
+            if (!byId[bid]) {
+                // create placeholder building if missing (some vehicles may reference buildings not in list)
+                byId[bid] = {
+                    id: bid,
+                    name: `Wache ${bid}`,
+                    staff: 0,
+                    raw: null,
+                    vehicles: [],
+                    staff_needed: 0
+                };
+            }
+            // normalized vehicle fields
+            const vehicle = {
+                id: v.id ?? v.vehicle_id ?? null,
+                name: v.caption || v.name || v.caption_raw || '',
+                max_personnel: Number(v.max_personnel_override ?? v.max_personnel ?? v.staff_required ?? 0),
+                raw: v
+            };
+            byId[bid].vehicles.push(vehicle);
+            byId[bid].staff_needed += vehicle.max_personnel;
+        });
+
+        // compute summary per building
+        const arr = Object.values(byId).map(b => {
+            return {
+                id: b.id,
+                name: b.name,
+                staff: Number(b.staff || 0),
+                vehicles: b.vehicles || [],
+                vehicle_count: (b.vehicles || []).length,
+                staff_needed: Number(b.staff_needed || 0),
+                raw: b.raw
+            };
+        });
+
+        return arr;
+    }
+
+    /************************************************************************
+     * UI: Erzeuge Fenster (dragbar + resizable), Button, Controls
+     ************************************************************************/
+    // load saved UI state or defaults
+    const saved = loadSettings() || {};
+    const UI_STATE = {
+        left: saved.left ?? null,
+        top: saved.top ?? null,
+        widthPercent: saved.widthPercent ?? CFG.defaultWidthPercent,
+        heightPercent: saved.heightPercent ?? CFG.defaultHeightPercent,
+        autoRefresh: saved.autoRefresh ?? false,
+        autoRefreshMs: saved.autoRefreshMs ?? CFG.autoRefreshMs,
+        filterMode: saved.filterMode ?? 'all', // all, deficit, ok
+        sortKey: saved.sortKey ?? 'name', // name, staff_diff, staff, vehicles
+        sortDir: saved.sortDir ?? 'asc',
+        search: saved.search ?? ''
+    };
+
+    let AUTO_REFRESH_TIMER = null;
+
+    function persistUiState() {
+        saveSettings(UI_STATE);
+    }
+
+    function createButton() {
+        if (document.getElementById('lss-per-button')) return;
+        const btn = document.createElement('button');
+        btn.id = 'lss-per-button';
+        btn.title = 'Personalübersicht öffnen';
+        btn.textContent = 'P';
+        Object.assign(btn.style, {
+            position: 'fixed', left: '10px', top: '10px', width: '52px', height: '52px',
+            borderRadius: '50%', background: '#c9302c', color: '#fff', border: `2px solid ${UI_COLORS.border}`,
+            zIndex: 999999, cursor: 'pointer', fontWeight: 800, boxShadow: '0 4px 10px rgba(0,0,0,0.5)'
+        });
+        btn.addEventListener('click', () => {
+            const win = document.getElementById('lss-per-window');
+            if (!win) return;
+            win.style.display = (win.style.display === 'block') ? 'none' : 'block';
+            if (win.style.display === 'block') {
+                refreshAndRender();
+                if (UI_STATE.autoRefresh) startAutoRefresh();
+            } else stopAutoRefresh();
+        });
+        document.body.appendChild(btn);
+    }
+
+    function createWindow() {
+        if (document.getElementById('lss-per-window')) return;
+        const win = document.createElement('div');
+        win.id = 'lss-per-window';
+        win.setAttribute('role', 'dialog');
+
+        // size/position
+        const w = Math.max(CFG.minWidthPx, Math.floor(window.innerWidth * (UI_STATE.widthPercent / 100)));
+        const h = Math.max(CFG.minHeightPx, Math.floor(window.innerHeight * (UI_STATE.heightPercent / 100)));
+        const left = (UI_STATE.left !== null) ? UI_STATE.left : (window.innerWidth - w - 20);
+        const top = (UI_STATE.top !== null) ? UI_STATE.top : 80;
+
+        Object.assign(win.style, {
+            position: 'fixed', left: left + 'px', top: top + 'px',
+            width: w + 'px', height: h + 'px',
+            background: UI_COLORS.windowBg, color: '#fff', zIndex: 999998, border: `2px solid ${UI_COLORS.border}`,
+            boxShadow: '0 8px 30px rgba(0,0,0,0.6)', display: 'none', borderRadius: '8px', overflow: 'hidden', fontFamily: 'Arial, sans-serif', fontSize: '13px'
+        });
+
+        // header (drag)
+        const header = document.createElement('div');
+        header.id = 'lss-per-header';
+        Object.assign(header.style, {
+            background: UI_COLORS.headerBg, color: UI_COLORS.headerFg, padding: '8px 10px', cursor: 'move',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between'
+        });
+        header.innerHTML = `<div style="display:flex;align-items:center;gap:8px"><strong>Personalübersicht</strong><span style="color:${UI_COLORS.subtle};font-size:12px;margin-left:6px">(${location.host})</span></div>`;
+
+        const headerControls = document.createElement('div');
+        headerControls.style.display = 'flex';
+        headerControls.style.gap = '8px';
+        // minimize, close
+         const btnMin = document.createElement('button'); btnMin.title = 'Minimieren'; btnMin.textContent = '';
+        const btnClose = document.createElement('button'); btnClose.title = 'Schließen'; btnClose.textContent = '✖';
+        [btnMin, btnClose].forEach(b => {
+            Object.assign(b.style, { background: 'transparent', border: 'none', color: UI_COLORS.headerFg, cursor: 'pointer', fontSize: '14px' });
+        });
+        headerControls.appendChild(btnMin);
+        headerControls.appendChild(btnClose);
+        header.appendChild(headerControls);
+        win.appendChild(header);
+        // main content area
+        const content = document.createElement('div');
+        content.id = 'lss-per-content';
+        Object.assign(content.style, { display: 'flex', height: `calc(100% - 40px)` });
+
+        // left panel: controls
+        const leftPanel = document.createElement('div');
+        leftPanel.id = 'lss-per-left';
+        Object.assign(leftPanel.style, { width: '320px', minWidth: '220px', padding: '12px', boxSizing: 'border-box', background: UI_COLORS.panelBg, borderRight: `1px solid ${UI_COLORS.border}`, overflow: 'auto' });
+
+        // right panel: table / list
+        const rightPanel = document.createElement('div');
+        rightPanel.id = 'lss-per-right';
+        Object.assign(rightPanel.style, { flex: '1 1 auto', padding: '8px', boxSizing: 'border-box', overflow: 'auto' });
+
+        // populate left panel controls: filters, search, auto-refresh, export
+        leftPanel.innerHTML = `
+            <div style="margin-bottom:10px">
+                <label style="font-weight:700">Suche</label><br>
+                <input id="lss-per-search" type="text" placeholder="Wache oder Fahrzeug..." style="width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid ${UI_COLORS.border};background:#0b0b0b;color:#fff">
+            </div>
+            <div style="margin-bottom:10px">
+                <label style="font-weight:700">Filter</label><br>
+                <select id="lss-per-filter" style="width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid ${UI_COLORS.border};background:#0b0b0b;color:#fff">
+                    <option value="all">Alle Wachen</option>
+                    <option value="deficit">Nur mit Defizit (staff < needed)</option>
+                    <option value="ok">Nur gedeckt (staff >= needed)</option>
+                </select>
+            </div>
+            <div style="margin-bottom:10px">
+                <label style="font-weight:700">Sortiere nach</label><br>
+                <select id="lss-per-sort" style="width:100%;padding:6px;margin-top:6px;border-radius:4px;border:1px solid ${UI_COLORS.border};background:#0b0b0b;color:#fff">
+                    <option value="name">Name (A→Z)</option>
+                    <option value="staff_diff">Personal-Defizit (größtes zuerst)</option>
+                    <option value="staff">Personal (wenig → viel)</option>
+                    <option value="vehicles">Anzahl Fahrzeuge (viel → wenig)</option>
+                </select>
+            </div>
+            <div style="margin-bottom:10px">
+                <label style="font-weight:700">Auto-Refresh</label><br>
+                <input id="lss-per-autorefresh" type="checkbox"> Aktivieren<br>
+                <input id="lss-per-autorefresh-interval" type="number" min="5" style="width:100%;margin-top:6px;padding:6px;border-radius:4px;border:1px solid ${UI_COLORS.border};background:#0b0b0b;color:#fff" placeholder="Sekunden">
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:8px">
+                <button id="lss-per-refresh" style="flex:1;padding:8px;border-radius:6px;border:1px solid ${UI_COLORS.border};cursor:pointer">🔄 Aktualisieren</button>
+                <button id="lss-per-export" style="flex:1;padding:8px;border-radius:6px;border:1px solid ${UI_COLORS.border};cursor:pointer">⬇️ Export CSV</button>
+            </div>
+            <div style="font-size:12px;color:${UI_COLORS.subtle}">
+                <div>Origin: <code id="lss-per-origin">${ORIGIN}</code></div>
+                <div id="lss-per-status" style="margin-top:6px">Status: bereit</div>
+            </div>
+        `;
+
+        // basic structure append
+        content.appendChild(leftPanel);
+        content.appendChild(rightPanel);
+        win.appendChild(content);
+
+        // resizer handle (bottom-right)
+        const resizer = document.createElement('div');
+        Object.assign(resizer.style, {
+            position: 'absolute', width: '14px', height: '14px', right: '4px', bottom: '4px',
+            cursor: 'nwse-resize', zIndex: 1000000, opacity: 0.6
+        });
+        win.appendChild(resizer);
+
+        document.body.appendChild(win);
+
+        // wire header drag
+        makeDraggable(win, header);
+        // wire resizer
+        makeResizable(win, resizer);
+
+        // wire header buttons
+        btnClose.addEventListener('click', () => { win.style.display = 'none'; stopAutoRefresh(); });
+        btnMin.addEventListener('click', () => {
+            if (rightPanel.style.display !== 'none') {
+                // minimize
+                rightPanel.style.display = 'none';
+                leftPanel.style.width = '100%';
+                win.style.height = '60px';
+            } else {
+                // restore
+                rightPanel.style.display = 'block';
+                leftPanel.style.width = '320px';
+                // restore saved height
+                const hperc = UI_STATE.heightPercent ?? CFG.defaultHeightPercent;
+                const hpx = Math.max(CFG.minHeightPx, Math.floor(window.innerHeight * (hperc / 100)));
+                win.style.height = hpx + 'px';
+            }
+        });
+
+        // wire controls events
+        document.getElementById('lss-per-search').addEventListener('input', (e) => { UI_STATE.search = e.target.value.trim(); persistUiState(); applyFiltersAndRender(); });
+        document.getElementById('lss-per-filter').addEventListener('change', (e) => { UI_STATE.filterMode = e.target.value; persistUiState(); applyFiltersAndRender(); });
+        document.getElementById('lss-per-sort').addEventListener('change', (e) => { UI_STATE.sortKey = e.target.value; persistUiState(); applyFiltersAndRender(); });
+        document.getElementById('lss-per-refresh').addEventListener('click', () => refreshAndRender());
+        document.getElementById('lss-per-export').addEventListener('click', () => exportCsv());
+        const autoChk = document.getElementById('lss-per-autorefresh');
+        const autoInt = document.getElementById('lss-per-autorefresh-interval');
+        autoChk.addEventListener('change', (e) => {
+            UI_STATE.autoRefresh = autoChk.checked;
+            persistUiState();
+            if (UI_STATE.autoRefresh) startAutoRefresh();
+            else stopAutoRefresh();
+        });
+        autoInt.addEventListener('change', (e) => {
+            const val = Number(e.target.value);
+            if (isNaN(val) || val < 5) { e.target.value = ''; return; }
+            UI_STATE.autoRefreshMs = val * 1000;
+            persistUiState();
+            if (UI_STATE.autoRefresh) startAutoRefresh();
+        });
+
+        // apply saved UI values to controls
+        document.getElementById('lss-per-filter').value = UI_STATE.filterMode;
+        document.getElementById('lss-per-sort').value = UI_STATE.sortKey;
+        document.getElementById('lss-per-search').value = UI_STATE.search;
+        autoChk.checked = UI_STATE.autoRefresh;
+        autoInt.value = (UI_STATE.autoRefreshMs / 1000) || (CFG.autoRefreshMs / 1000);
+
+        // initial empty render area
+        rightPanel.innerHTML = `<div id="lss-per-table-wrapper" style="height:100%;overflow:auto;padding-right:6px"></div>`;
+
+        // save position on window move/resize end
+        window.addEventListener('mouseup', () => saveWindowPositionAndSize(win));
+
+        // save on page unload
+        window.addEventListener('beforeunload', persistUiState);
+    }
+
+    /************************************************************************
+     * Drag & Resize Helpers
+     ************************************************************************/
+    function makeDraggable(win, handle) {
+        let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+        handle.addEventListener('mousedown', (e) => {
+            dragging = true;
+            startX = e.clientX; startY = e.clientY;
+            startLeft = parseInt(win.style.left || win.getBoundingClientRect().left, 10);
+            startTop = parseInt(win.style.top || win.getBoundingClientRect().top, 10);
+            document.body.style.userSelect = 'none';
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            let newLeft = startLeft + dx;
+            let newTop = startTop + dy;
+            // bound within window
+            newLeft = Math.max(6, Math.min(window.innerWidth - 60, newLeft));
+            newTop = Math.max(6, Math.min(window.innerHeight - 40, newTop));
+            win.style.left = newLeft + 'px';
+            win.style.top = newTop + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+            if (dragging) {
+                dragging = false;
+                document.body.style.userSelect = '';
+                // save coords
+                UI_STATE.left = parseInt(win.style.left, 10);
+                UI_STATE.top = parseInt(win.style.top, 10);
+                persistUiState();
+            }
+        });
+    }
+
+    function makeResizable(win, resizer) {
+        let resizing = false, startX = 0, startY = 0, startW = 0, startH = 0;
+        resizer.addEventListener('mousedown', (e) => {
+            resizing = true;
+            startX = e.clientX; startY = e.clientY;
+            startW = win.getBoundingClientRect().width; startH = win.getBoundingClientRect().height;
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', (e) => {
+            if (!resizing) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            let w = Math.max(CFG.minWidthPx, startW + dx);
+            let h = Math.max(CFG.minHeightPx, startH + dy);
+            // bound
+            w = Math.min(window.innerWidth - 20, w);
+            h = Math.min(window.innerHeight - 20, h);
+            win.style.width = w + 'px';
+            win.style.height = h + 'px';
+        });
+        document.addEventListener('mouseup', () => {
+            if (resizing) {
+                resizing = false;
+                document.body.style.userSelect = '';
+                // save percent sizes
+                UI_STATE.widthPercent = Math.round((parseInt(document.getElementById('lss-per-window').style.width, 10) / window.innerWidth) * 100);
+                UI_STATE.heightPercent = Math.round((parseInt(document.getElementById('lss-per-window').style.height, 10) / window.innerHeight) * 100);
+                persistUiState();
+            }
+        });
+    }
+
+    function saveWindowPositionAndSize(win) {
+        try {
+            UI_STATE.left = parseInt(win.style.left, 10);
+            UI_STATE.top = parseInt(win.style.top, 10);
+            UI_STATE.widthPercent = Math.round((parseInt(win.style.width, 10) / window.innerWidth) * 100);
+            UI_STATE.heightPercent = Math.round((parseInt(win.style.height, 10) / window.innerHeight) * 100);
+            persistUiState();
+        } catch (e) { /* ignore */ }
+    }
+
+    /************************************************************************
+     * Rendering: Filter, Sort, Build table with exact counts & expandable lists
+     ************************************************************************/
+    let CURRENT_DATA = []; // array of buildings with counts
+
+    function setStatus(text, isError = false) {
+        const el = document.getElementById('lss-per-status');
+        if (!el) return;
+        el.textContent = `Status: ${text}`;
+        el.style.color = isError ? UI_COLORS.bad : UI_COLORS.subtle;
+    }
+
+    function renderTable(buildings) {
+        CURRENT_DATA = buildings.slice(); // copy
+        applyFiltersAndRender();
+    }
+
+    function applyFiltersAndRender() {
+        const wrapper = document.getElementById('lss-per-table-wrapper');
+        if (!wrapper) return;
+        let data = (CURRENT_DATA || []).slice();
+
+        // search
+        const search = (UI_STATE.search || '').toLowerCase();
+        if (search) {
+            data = data.filter(b => {
+                if ((b.name || '').toLowerCase().includes(search)) return true;
+                // search vehicles names
+                for (const v of (b.vehicles || [])) {
+                    if ((v.name || '').toLowerCase().includes(search)) return true;
+                }
+                return false;
+            });
+        }
+
+        // filter
+        if (UI_STATE.filterMode === 'deficit') data = data.filter(b => (b.staff || 0) < (b.staff_needed || 0));
+        else if (UI_STATE.filterMode === 'ok') data = data.filter(b => (b.staff || 0) >= (b.staff_needed || 0));
+
+        // enrich: diff
+        data.forEach(b => { b.diff = (b.staff || 0) - (b.staff_needed || 0); });
+
+        // sort
+        const k = UI_STATE.sortKey;
+        const dir = UI_STATE.sortDir === 'asc' ? 1 : -1;
+        data.sort((a, b) => {
+            if (k === 'name') {
+                return (a.name || '').localeCompare(b.name || '') * (UI_STATE.sortDir === 'asc' ? 1 : -1);
+            } else if (k === 'staff_diff') {
+                return ((a.diff || 0) - (b.diff || 0)) * -1; // largest deficit first
+            } else if (k === 'staff') {
+                return ((a.staff || 0) - (b.staff || 0)) * (UI_STATE.sortDir === 'asc' ? 1 : -1);
+            } else if (k === 'vehicles') {
+                return ((a.vehicle_count || 0) - (b.vehicle_count || 0)) * -1;
+            }
+            return 0;
+        });
+
+        // build HTML table
+        const rows = [];
+        rows.push(`<table style="width:100%;border-collapse:collapse">`);
+        rows.push(`<thead><tr>
+            <th style="text-align:left;padding:8px;border-bottom:1px solid ${UI_COLORS.border}">Wache</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid ${UI_COLORS.border}">Personal (akt / benötigt)</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid ${UI_COLORS.border}">Diff</th>
+            <th style="text-align:right;padding:8px;border-bottom:1px solid ${UI_COLORS.border}">Fahrzeuge</th>
+            <th style="text-align:left;padding:8px;border-bottom:1px solid ${UI_COLORS.border}">Details</th>
+        </tr></thead><tbody>`);
+        data.forEach((b, idx) => {
+            const bg = (idx % 2 === 0) ? UI_COLORS.rowEven : UI_COLORS.rowOdd;
+            const color = (b.staff || 0) < (b.staff_needed || 0) ? UI_COLORS.bad : UI_COLORS.ok;
+            const diff = (b.staff || 0) - (b.staff_needed || 0);
+            rows.push(`<tr style="background:${bg};vertical-align:top"><td style="padding:8px">${escapeHtml(b.name)}</td>
+                <td style="padding:8px;text-align:right;color:${color}">${b.staff || 0} / ${b.staff_needed || 0}</td>
+                <td style="padding:8px;text-align:right">${diff}</td>
+                <td style="padding:8px;text-align:right">${b.vehicle_count || 0}</td>
+                <td style="padding:8px;text-align:left"> <button data-bid="${b.id}" class="lss-per-toggle">▶</button> <span class="lss-per-vehicle-summary">${escapeHtml(makeVehicleSummary(b))}</span></td>
+            </tr>`);
+            // expandable row (hidden by default)
+            rows.push(`<tr class="lss-per-expand" id="lss-per-expand-${b.id}" style="display:none;background:${UI_COLORS.panelBg}"><td colspan="5" style="padding:8px">` +
+                `<div style="max-height:220px;overflow:auto;padding-right:6px">${makeVehicleDetailsHtml(b)}</div></td></tr>`);
+        });
+        rows.push(`</tbody></table>`);
+
+        wrapper.innerHTML = rows.join('\n');
+
+        // attach toggle handlers
+        const toggles = wrapper.querySelectorAll('.lss-per-toggle');
+        toggles.forEach(t => t.addEventListener('click', (e) => {
+            const bid = e.currentTarget.getAttribute('data-bid');
+            const tr = document.getElementById('lss-per-expand-' + bid);
+            if (!tr) return;
+            if (tr.style.display === 'none') {
+                tr.style.display = 'table-row';
+                e.currentTarget.textContent = '▼';
+            } else {
+                tr.style.display = 'none';
+                e.currentTarget.textContent = '▶';
+            }
+        }));
+
+        // update status
+        setStatus(`Anzahl Wachen: ${data.length} (zeigt ${data.length} nach Filter/Search) — Letzte Aktualisierung: ${new Date().toLocaleTimeString()}`);
+    }
+
+    function makeVehicleSummary(b) {
+        // give a compact "Typ: count, Typ2: count"
+        const map = {};
+        (b.vehicles || []).forEach(v => {
+            const n = v.name || 'N/A';
+            map[n] = (map[n] || 0) + 1;
+        });
+        const parts = Object.keys(map).slice(0, 6).map(k => `${map[k]}× ${k}`);
+        return parts.join(', ') + ((Object.keys(map).length > 6) ? `, …(${Object.keys(map).length} Typen)` : '');
+    }
+
+    function makeVehicleDetailsHtml(b) {
+        if (!b.vehicles || b.vehicles.length === 0) return `<em>Keine Fahrzeuge</em>`;
+        // group by name
+        const map = {};
+        (b.vehicles || []).forEach(v => {
+            const n = v.name || 'Unbenannt';
+            if (!map[n]) map[n] = [];
+            map[n].push(v);
+        });
+        const rows = [];
+        rows.push('<table style="width:100%;border-collapse:collapse">');
+        rows.push('<thead><tr><th style="text-align:left;padding:6px;border-bottom:1px solid ' + UI_COLORS.border + '">Fahrzeug</th><th style="text-align:right;padding:6px;border-bottom:1px solid ' + UI_COLORS.border + '">Anzahl</th><th style="text-align:right;padding:6px;border-bottom:1px solid ' + UI_COLORS.border + '">Personal benötigt (pro)</th></tr></thead><tbody>');
+        Object.keys(map).forEach(k => {
+            const arr = map[k];
+            const per = arr[0].max_personnel || 0;
+            rows.push(`<tr><td style="padding:6px">${escapeHtml(k)}</td><td style="padding:6px;text-align:right">${arr.length}</td><td style="padding:6px;text-align:right">${per}</td></tr>`);
+        });
+        rows.push('</tbody></table>');
+        return rows.join('');
+    }
+
+    function escapeHtml(s) {
+        if (!s) return '';
+        return String(s).replace(/[&<>"'`]/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' })[m]);
+    }
+
+    /************************************************************************
+     * Actions: load data, refresh, start/stop auto-refresh, export CSV
+     ************************************************************************/
+    async function refreshAndRender() {
+        setStatus('Lade Gebäude & Fahrzeuge …');
+        try {
+            const [buildings, vehicles] = await Promise.all([loadBuildings(), loadVehiclesAll()]);
+            setStatus(`Geladen: ${buildings.length} Gebäude, ${vehicles.length} Fahrzeuge — verarbeite…`);
+            const arr = buildIndex(buildings, vehicles);
+            renderTable(arr);
+        } catch (e) {
+            console.error('LSS-PER: refresh failed', e);
+            setStatus('Fehler beim Laden (siehe Konsole)', true);
+        }
+    }
+
+    function startAutoRefresh() {
+        if (AUTO_REFRESH_TIMER) clearInterval(AUTO_REFRESH_TIMER);
+        AUTO_REFRESH_TIMER = setInterval(() => {
+            const win = document.getElementById('lss-per-window');
+            if (!win || win.style.display !== 'block') {
+                stopAutoRefresh(); return;
+            }
+            refreshAndRender();
+        }, UI_STATE.autoRefreshMs || CFG.autoRefreshMs);
+        setStatus(`Auto-Refresh aktiv (${(UI_STATE.autoRefreshMs || CFG.autoRefreshMs) / 1000}s)`);
+    }
+    function stopAutoRefresh() {
+        if (AUTO_REFRESH_TIMER) { clearInterval(AUTO_REFRESH_TIMER); AUTO_REFRESH_TIMER = null; setStatus('Auto-Refresh gestoppt'); }
+    }
+
+    function exportCsv() {
+        // export CURRENT_DATA (after filter/sort?) -> export full current view
+        const wrapper = document.getElementById('lss-per-table-wrapper');
+        if (!wrapper) return;
+        // build CSV from CURRENT_DATA filtered by current UI
+        let data = (CURRENT_DATA || []).slice();
+
+        // apply UI filters same as table
+        const search = (UI_STATE.search || '').toLowerCase();
+        if (search) data = data.filter(b => (b.name || '').toLowerCase().includes(search) || (b.vehicles || []).some(v => (v.name || '').toLowerCase().includes(search)));
+        if (UI_STATE.filterMode === 'deficit') data = data.filter(b => (b.staff || 0) < (b.staff_needed || 0));
+        else if (UI_STATE.filterMode === 'ok') data = data.filter(b => (b.staff || 0) >= (b.staff_needed || 0));
+        // CSV header: id,name,staff,staff_needed,diff,vehicle_count,vehicle_names
+        const lines = [];
+        lines.push(['id','name','staff','staff_needed','diff','vehicle_count','vehicle_summary'].join(','));
+        data.forEach(b => {
+            const summary = (b.vehicles || []).map(v => `${(v.name||'').replace(/,/g,';')}`).join('|');
+            const diff = (b.staff || 0) - (b.staff_needed || 0);
+            lines.push([b.id, `"${(b.name||'').replace(/"/g,'""')}"`, b.staff || 0, b.staff_needed || 0, diff, b.vehicle_count || 0, `"${summary}"`].join(','));
+        });
+        const csv = lines.join('\n');
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `lss_personal_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'_')}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+    }
+
+    /************************************************************************
+     * Boot
+     ************************************************************************/
+    (function init() {
+        createButton();
+        createWindow();
+        // show default window on first use?
+        const win = document.getElementById('lss-per-window');
+        if (win) {
+            // ensure window visibility if not presen
+            // ensure position / size reflect saved values
+            if (UI_STATE.left !== null) win.style.left = UI_STATE.left + 'px';
+            if (UI_STATE.top !== null) win.style.top = UI_STATE.top + 'px';
+            if (UI_STATE.widthPercent) {
+                const w = Math.max(CFG.minWidthPx, Math.floor(window.innerWidth * (UI_STATE.widthPercent / 100)));
+                win.style.width = w + 'px';
+            }
+            if (UI_STATE.heightPercent) {
+                const h = Math.max(CFG.minHeightPx, Math.floor(window.innerHeight * (UI_STATE.heightPercent / 100)));
+                win.style.height = h + 'px';
+            }
+            // initial load
+            refreshAndRender();
+            if (UI_STATE.autoRefresh) startAutoRefresh();
+        }
+    })();
+
+})();
