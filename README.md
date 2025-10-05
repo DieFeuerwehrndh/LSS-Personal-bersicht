@@ -1,4 +1,6 @@
-# LSS Personalübersicht - Vollversion(AKKTUELL ÜBERARBEITUNG)
+# LSS Personalübersicht - Vollversion
+
+Unser Discord Server https://discord.gg/pWXSYEYRAu
 
 Ein Userscript für [Leitstellenspiel.de](https://www.leitstellenspiel.de/), das eine **dragbare und resizable Personalübersicht** bietet. Alle Gebäude, exakte Fahrzeugzählungen, Filter, Sortierung, Auto-Refresh und CSV-Export inklusive.
 
