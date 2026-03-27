@@ -2,10 +2,10 @@
 
 Unser Discord Server https://discord.gg/pWXSYEYRAu
 
-Ein Userscript für [Leitstellenspiel.de](https://www.leitstellenspiel.de/), das eine **dragbare und resizable Personalübersicht** bietet. Alle Gebäude, exakte Fahrzeugzählungen, Filter, Sortierung, Auto-Refresh und CSV-Export inklusive.
+Ein Userscript für [Leitstellenspiel.de](https://www.leitstellenspiel.de/), das ein **Fenster für die Personalübersicht** bietet. Alle Gebäude, exakte Fahrzeugzählungen, Filter, Sortierung, Auto-Refresh und CSV-Export inklusive.
 
 ---
-
+**HINWEIS** Man muss in den wachen das ziel eingeben
 ## Funktionen
 
 - Übersicht aller Wachen mit aktuellem Personal und benötigtem Personal
